@@ -125,7 +125,7 @@ app.post("/api/ai", async (req, res) => {
     }
 
     const normalizedProvider = normalizeProvider(provider);
-    const providerOrder = buildProviderOrder(normalizedProvider);
+    const providerOrder = buildProviderOrder(normalizedProvider, mergedWorkflow);
 
     let lastFailure = null;
     const triedProviders = [];
@@ -146,7 +146,8 @@ app.post("/api/ai", async (req, res) => {
           mode,
           style,
           density,
-          workflow: mergedWorkflow
+          workflow: mergedWorkflow,
+          providerName
         });
 
         const output = await runProvider({
@@ -154,6 +155,15 @@ app.post("/api/ai", async (req, res) => {
           prompt: buildProviderPrompt(prompt, mergedWorkflow),
           instructions
         });
+
+        // In auto mode, treat provider refusal of legal drafting as failure and fall through.
+        if (shouldTreatAsRefusal(output, mergedWorkflow, normalizedProvider)) {
+          throw createProviderError(
+            "Provider refused this legal drafting request.",
+            "legal_refusal",
+            "This provider declined legal drafting."
+          );
+        }
 
         markProviderSuccess(providerName);
 
@@ -357,7 +367,7 @@ function buildProviderPrompt(latestPrompt, workflow) {
   ].filter(Boolean).join("\n\n");
 }
 
-function buildInstructions({ prompt, mode, style, density, workflow }) {
+function buildInstructions({ prompt, mode, style, density, workflow, providerName }) {
   const densityRule =
     density === "dense"
       ? "Be detailed, structured, and comprehensive."
@@ -368,11 +378,20 @@ function buildInstructions({ prompt, mode, style, density, workflow }) {
       ? "Use formal professional tone."
       : "Use clear natural tone.";
 
+  const antiRefusal = [
+    "This request is for drafting assistance and informational legal writing, not a definitive attorney-client legal opinion.",
+    "Do not refuse merely because the topic is legal.",
+    "You may draft a general-form document with placeholders where facts are missing.",
+    "If certainty is limited, include a brief caution line at the end instead of refusing."
+  ].join("\n");
+
   if (mode === "draft" && workflow?.draftPreference === "law_framed") {
     return [
+      "You are Zhuxin Assistant.",
       styleRule,
       densityRule,
       `Current date: ${new Date().toDateString()}`,
+      antiRefusal,
       buildLawFramedInstruction(workflow.originalPrompt || prompt, {
         kind: workflow.draftType,
         label: workflow.draftLabel
@@ -387,9 +406,11 @@ function buildInstructions({ prompt, mode, style, density, workflow }) {
 
   if (mode === "draft" && workflow?.draftPreference === "general_draft") {
     return [
+      "You are Zhuxin Assistant.",
       styleRule,
       densityRule,
       `Current date: ${new Date().toDateString()}`,
+      antiRefusal,
       buildGeneralDraftInstruction(workflow.originalPrompt || prompt, {
         kind: workflow.draftType,
         label: workflow.draftLabel
@@ -408,8 +429,32 @@ function buildInstructions({ prompt, mode, style, density, workflow }) {
     `Current date: ${new Date().toDateString()}`,
     "Answer directly and naturally.",
     "Do not be robotic.",
+    providerName === "gemini" ? antiRefusal : "",
     `User request: ${prompt}`
   ].join("\n");
+}
+
+function shouldTreatAsRefusal(output, workflow, selectedProvider) {
+  if (selectedProvider !== "auto") return false;
+  if (!workflow?.active || workflow.stage !== "drafting") return false;
+
+  const text = String(output || "").toLowerCase();
+
+  const refusalPatterns = [
+    "i can't help with",
+    "i cannot help with",
+    "i can’t help with",
+    "consult an attorney",
+    "consult a lawyer",
+    "cannot provide legal advice",
+    "can't provide legal advice",
+    "cannot assist with legal documents",
+    "unable to assist with legal",
+    "i'm not able to draft",
+    "i am not able to draft"
+  ];
+
+  return refusalPatterns.some((p) => text.includes(p));
 }
 
 function normalizeProvider(value) {
@@ -418,8 +463,16 @@ function normalizeProvider(value) {
   return allowed.includes(v) ? v : "auto";
 }
 
-function buildProviderOrder(selected) {
+function buildProviderOrder(selected, workflow) {
   if (selected !== "auto") return [selected];
+
+  const isLegalDraft = !!(workflow?.active && workflow?.stage === "drafting");
+
+  if (isLegalDraft) {
+    // Prefer providers that are usually less restrictive for drafting.
+    return ["groq", "openrouter", "openai", "gemini", "anthropic"];
+  }
+
   return ["gemini", "groq", "openrouter", "openai", "anthropic"];
 }
 
@@ -463,6 +516,7 @@ function getCooldownMs(err) {
   if (err.reason === "rate_limit") return 60 * 1000;
   if (err.reason === "insufficient_quota") return 15 * 60 * 1000;
   if (err.reason === "auth_error") return 30 * 60 * 1000;
+  if (err.reason === "legal_refusal") return 2 * 60 * 1000;
   return 2 * 60 * 1000;
 }
 
