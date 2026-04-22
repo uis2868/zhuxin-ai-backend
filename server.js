@@ -24,11 +24,36 @@ const MODELS = {
 };
 
 const providerState = {
-  openai: { available: !!KEYS.openai, reason: !!KEYS.openai ? null : "missing_key", retryAt: null, lastError: null },
-  gemini: { available: !!KEYS.gemini, reason: !!KEYS.gemini ? null : "missing_key", retryAt: null, lastError: null },
-  groq: { available: !!KEYS.groq, reason: !!KEYS.groq ? null : "missing_key", retryAt: null, lastError: null },
-  anthropic: { available: !!KEYS.anthropic, reason: !!KEYS.anthropic ? null : "missing_key", retryAt: null, lastError: null },
-  openrouter: { available: !!KEYS.openrouter, reason: !!KEYS.openrouter ? null : "missing_key", retryAt: null, lastError: null }
+  openai: {
+    available: !!KEYS.openai,
+    reason: !!KEYS.openai ? null : "missing_key",
+    retryAt: null,
+    lastError: null
+  },
+  gemini: {
+    available: !!KEYS.gemini,
+    reason: !!KEYS.gemini ? null : "missing_key",
+    retryAt: null,
+    lastError: null
+  },
+  groq: {
+    available: !!KEYS.groq,
+    reason: !!KEYS.groq ? null : "missing_key",
+    retryAt: null,
+    lastError: null
+  },
+  anthropic: {
+    available: !!KEYS.anthropic,
+    reason: !!KEYS.anthropic ? null : "missing_key",
+    retryAt: null,
+    lastError: null
+  },
+  openrouter: {
+    available: !!KEYS.openrouter,
+    reason: !!KEYS.openrouter ? null : "missing_key",
+    retryAt: null,
+    lastError: null
+  }
 };
 
 app.use(cors());
@@ -54,7 +79,8 @@ app.get("/health", (_req, res) => {
           available: state.available,
           reason: state.reason,
           retryAt: state.retryAt,
-          hasKey: Boolean(KEYS[name])
+          hasKey: Boolean(KEYS[name]),
+          lastError: state.lastError
         }
       ])
     )
@@ -74,16 +100,34 @@ app.post("/api/ai", async (req, res) => {
     } = req.body || {};
 
     if (!prompt.trim()) {
-      return res.status(400).json({ error: "Prompt is required" });
+      return res.status(400).json({
+        error: "Prompt is required"
+      });
     }
 
     const normalizedProvider = normalizeProvider(provider);
     const providerOrder = buildProviderOrder(normalizedProvider);
 
+    console.log("[REQUEST]", {
+      provider: normalizedProvider,
+      mode,
+      style,
+      density,
+      promptPreview: prompt.slice(0, 80)
+    });
+
     let lastFailure = null;
+    const triedProviders = [];
 
     for (const providerName of providerOrder) {
-      if (!isProviderUsable(providerName)) continue;
+      if (!isProviderUsable(providerName)) {
+        triedProviders.push({
+          provider: providerName,
+          skipped: true,
+          reason: providerState[providerName]?.reason || "unavailable"
+        });
+        continue;
+      }
 
       try {
         const output = await runProvider({
@@ -96,19 +140,45 @@ app.post("/api/ai", async (req, res) => {
 
         markProviderSuccess(providerName);
 
+        console.log("[SUCCESS]", {
+          provider: providerName,
+          mode,
+          style,
+          density
+        });
+
         return res.json({
           ok: true,
           provider: providerName,
-          output
+          output,
+          statusMessage:
+            normalizedProvider === "auto"
+              ? `Completed with ${labelProvider(providerName)}.`
+              : `Completed with ${labelProvider(providerName)}.`,
+          triedProviders
         });
       } catch (err) {
         lastFailure = err;
         markProviderFailure(providerName, err);
+
+        triedProviders.push({
+          provider: providerName,
+          skipped: false,
+          reason: err.reason || "provider_error",
+          message: err.publicMessage || err.message || "Provider failed"
+        });
+
+        console.log("[FAILURE]", {
+          provider: providerName,
+          reason: err.reason,
+          message: err.message
+        });
       }
     }
 
     return res.status(503).json({
-      error: lastFailure?.message || "No AI provider is currently available",
+      error: lastFailure?.publicMessage || "No AI provider is currently available.",
+      triedProviders,
       providers: summarizeProviders()
     });
   } catch (err) {
@@ -126,7 +196,9 @@ function normalizeProvider(value) {
 
 function buildProviderOrder(selected) {
   if (selected !== "auto") return [selected];
-  return ["openai", "gemini", "groq", "anthropic", "openrouter"];
+
+  // Free/working-first order for your current setup
+  return ["gemini", "groq", "openrouter", "openai", "anthropic"];
 }
 
 function isProviderUsable(name) {
@@ -157,7 +229,8 @@ function summarizeProviders() {
       {
         available: isProviderUsable(name),
         reason: state.reason,
-        retryAt: state.retryAt
+        retryAt: state.retryAt,
+        lastError: state.lastError
       }
     ])
   );
@@ -175,47 +248,89 @@ function markProviderFailure(name, err) {
   providerState[name].available = false;
   providerState[name].reason = err.reason || "provider_error";
   providerState[name].retryAt = Date.now() + cooldownMs;
-  providerState[name].lastError = err.message || "Provider failed";
+  providerState[name].lastError = err.publicMessage || err.message || "Provider failed";
 }
 
 function getCooldownMs(err) {
-  if (err.reason === "rate_limit") return 60 * 1000;         // 1 min
-  if (err.reason === "insufficient_quota") return 15 * 60 * 1000; // 15 min
-  if (err.reason === "auth_error") return 30 * 60 * 1000;    // 30 min
-  return 2 * 60 * 1000;                                      // 2 min
+  if (err.reason === "rate_limit") return 60 * 1000;
+  if (err.reason === "insufficient_quota") return 15 * 60 * 1000;
+  if (err.reason === "auth_error") return 30 * 60 * 1000;
+  return 2 * 60 * 1000;
 }
 
 async function runProvider({ providerName, prompt, mode, style, density }) {
-  const systemInstruction = buildInstruction(mode, style, density);
+  const instruction = buildInstruction(mode, style, density, prompt);
 
   if (providerName === "openai") {
-    return callOpenAI(systemInstruction, prompt);
+    return callOpenAI(instruction, prompt);
   }
   if (providerName === "gemini") {
-    return callGemini(systemInstruction, prompt);
+    return callGemini(instruction, prompt);
   }
   if (providerName === "groq") {
-    return callGroq(systemInstruction, prompt);
+    return callGroq(instruction, prompt);
   }
   if (providerName === "anthropic") {
-    return callAnthropic(systemInstruction, prompt);
+    return callAnthropic(instruction, prompt);
   }
   if (providerName === "openrouter") {
-    return callOpenRouter(systemInstruction, prompt);
+    return callOpenRouter(instruction, prompt);
   }
 
-  throw createProviderError("Unknown provider", "provider_error");
+  throw createProviderError("Unknown provider", "provider_error", "Provider selection failed.");
 }
 
-function buildInstruction(mode, style, density) {
-  return [
+function buildInstruction(mode, style, density, prompt) {
+  const densityRule =
+    density === "dense"
+      ? "Be detailed, structured, and comprehensive."
+      : "Be concise but complete.";
+
+  const styleRule =
+    style === "formal"
+      ? "Use formal professional tone."
+      : "Use clear natural tone.";
+
+  const base = [
     "You are Zhuxin Assistant.",
-    "Be helpful, accurate, and structured.",
-    `Mode: ${mode || "answer"}`,
-    `Style: ${style || "clear"}`,
-    `Density: ${density || "balanced"}`,
+    "Be helpful, accurate, practical, and structured.",
+    styleRule,
+    densityRule,
+    "Do not use markdown tables.",
     "Return plain text only."
-  ].join("\n");
+  ];
+
+  if (mode === "answer") {
+    base.push(
+      "Mode is answer.",
+      "Answer the user's request directly.",
+      "Start with the direct answer, then add brief structure if useful.",
+      "Do not turn a simple question into an unnecessary template."
+    );
+  } else if (mode === "draft") {
+    base.push(
+      "Mode is draft.",
+      "Produce a usable first draft, not commentary about how to draft.",
+      "If the user asks for a notice, letter, application, or message, draft the actual document body.",
+      "Use headings only when they improve readability."
+    );
+  } else if (mode === "revise") {
+    base.push(
+      "Mode is revise.",
+      "Rewrite the user's text directly.",
+      "Do not explain what you changed unless the user asks.",
+      "Preserve meaning while improving clarity, tone, and structure."
+    );
+  }
+
+  if (/talaq|divorce/i.test(prompt)) {
+    base.push(
+      "For sensitive legal or religious matters, do not provide jurisdiction-specific or religiously authoritative instructions unless clearly requested and safely framed.",
+      "You may provide a neutral informational template with a clear disclaimer when appropriate."
+    );
+  }
+
+  return base.join("\n");
 }
 
 async function callOpenAI(instructions, prompt) {
@@ -311,7 +426,6 @@ async function callAnthropic(instructions, prompt) {
 
   const data = await safeJson(response);
   ensureOk(response, data);
-
   return data?.content?.map((item) => item.text || "").join("") || "";
 }
 
@@ -347,22 +461,60 @@ function ensureOk(response, data) {
   const lower = String(message).toLowerCase();
 
   if (response.status === 401 || response.status === 403) {
-    throw createProviderError(message, "auth_error");
-  }
-  if (response.status === 429 || lower.includes("rate limit")) {
-    throw createProviderError(message, "rate_limit");
-  }
-  if (lower.includes("insufficient_quota") || lower.includes("quota") || response.status === 402) {
-    throw createProviderError(message, "insufficient_quota");
+    throw createProviderError(
+      message,
+      "auth_error",
+      "Authentication failed for this provider."
+    );
   }
 
-  throw createProviderError(message, "provider_error");
+  if (
+    response.status === 429 ||
+    lower.includes("rate limit") ||
+    lower.includes("too many requests")
+  ) {
+    throw createProviderError(
+      message,
+      "rate_limit",
+      "This provider is rate-limited right now."
+    );
+  }
+
+  if (
+    lower.includes("insufficient_quota") ||
+    lower.includes("quota") ||
+    response.status === 402
+  ) {
+    throw createProviderError(
+      message,
+      "insufficient_quota",
+      "This provider has reached its quota or billing limit."
+    );
+  }
+
+  throw createProviderError(
+    message,
+    "provider_error",
+    "This provider had a temporary error."
+  );
 }
 
-function createProviderError(message, reason) {
+function createProviderError(message, reason, publicMessage) {
   const err = new Error(message || "Provider request failed");
   err.reason = reason || "provider_error";
+  err.publicMessage = publicMessage || "Provider request failed.";
   return err;
+}
+
+function labelProvider(name) {
+  const map = {
+    openai: "OpenAI",
+    gemini: "Gemini",
+    groq: "Groq",
+    anthropic: "Anthropic",
+    openrouter: "OpenRouter"
+  };
+  return map[name] || name;
 }
 
 async function safeJson(response) {
