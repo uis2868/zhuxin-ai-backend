@@ -1,6 +1,10 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import {
+  resolveLegalDraftPolicy,
+  buildRegistryOutput
+} from "./legal-template-registry.js";
 
 dotenv.config();
 
@@ -80,10 +84,29 @@ app.post("/api/ai", async (req, res) => {
       });
     }
 
+    // LAW > TEMPLATE > CAUTION > AI
+    const legalPolicy = resolveLegalDraftPolicy({
+      prompt,
+      mode,
+      jurisdiction: "BD"
+    });
+
+    if (legalPolicy.route === "approved_template" || legalPolicy.route === "cautious_skeleton") {
+      const output = buildRegistryOutput(legalPolicy);
+
+      return res.json({
+        ok: true,
+        provider: "registry",
+        output,
+        statusMessage:
+          legalPolicy.route === "approved_template"
+            ? "Completed with approved legal template."
+            : "Completed with cautious legal skeleton. Expert review required."
+      });
+    }
+
     const normalizedProvider = normalizeProvider(provider);
     const providerOrder = buildProviderOrder(normalizedProvider);
-
-    const prepared = preparePrompt(prompt, mode);
 
     let lastFailure = null;
     const triedProviders = [];
@@ -99,21 +122,13 @@ app.post("/api/ai", async (req, res) => {
       }
 
       try {
-        let output;
-
-        // hard-coded safe template path for sensitive notice drafting
-        if (prepared.forceLocalTemplate) {
-          output = buildLocalTemplate(prepared);
-        } else {
-          output = await runProvider({
-            providerName,
-            prompt: prepared.prompt,
-            mode,
-            style,
-            density,
-            meta: prepared
-          });
-        }
+        const output = await runProvider({
+          providerName,
+          prompt,
+          mode,
+          style,
+          density
+        });
 
         markProviderSuccess(providerName);
 
@@ -217,93 +232,8 @@ function getCooldownMs(err) {
   return 2 * 60 * 1000;
 }
 
-function preparePrompt(rawPrompt, mode) {
-  const prompt = String(rawPrompt || "").trim();
-  const lower = prompt.toLowerCase();
-
-  const isTalaqNotice =
-    /talaq/.test(lower) ||
-    (/notice/.test(lower) && /divorce/.test(lower));
-
-  const extracted = {
-    wifeName: extractAfter(prompt, ["wife name is", "name is", "wife is"]),
-    husbandName: extractAfter(prompt, ["husband name is", "husband is"]),
-    keepBlank: /rest leave as blank|leave rest as blank|keep rest blank/i.test(prompt)
-  };
-
-  return {
-    prompt,
-    isTalaqNotice,
-    forceLocalTemplate: mode === "draft" && isTalaqNotice,
-    extracted
-  };
-}
-
-function extractAfter(text, patterns) {
-  for (const pattern of patterns) {
-    const re = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s+([A-Za-z .'-]+)", "i");
-    const match = text.match(re);
-    if (match && match[1]) return match[1].trim();
-  }
-  return "";
-}
-
-function buildLocalTemplate(prepared) {
-  const wifeName = prepared.extracted.wifeName || "[Wife Name]";
-  const husbandName = prepared.extracted.husbandName || "[Husband Name]";
-
-  return [
-    "GENERAL INFORMATIONAL TEMPLATE ONLY",
-    "This is a neutral general draft for informational use. Local law, court procedure, registration requirements, and religious rules may differ.",
-    "",
-    "NOTICE OF INTENTION / DECLARATION RELATING TO TALAQ",
-    "",
-    "From:",
-    `${husbandName}`,
-    "[Address]",
-    "[Phone Number]",
-    "",
-    "To:",
-    `${wifeName}`,
-    "[Address]",
-    "",
-    "Date:",
-    "[Date]",
-    "",
-    "Subject: Notice relating to talaq",
-    "",
-    "Dear " + wifeName + ",",
-    "",
-    "This notice is being issued as a general written communication regarding talaq. The details, legal effect, procedural requirements, date of effectiveness, and any registration or notice obligations shall be governed by the applicable law and competent authority.",
-    "",
-    "For record purposes, the relevant details are stated below:",
-    "1. Husband's name: " + husbandName,
-    "2. Wife's name: " + wifeName,
-    "3. Date of marriage: [Date of Marriage]",
-    "4. Place of marriage: [Place of Marriage]",
-    "5. Address of husband: [Husband Address]",
-    "6. Address of wife: [Wife Address]",
-    "",
-    "Statement:",
-    "[Insert the intended statement here in the exact form advised by your qualified lawyer / lawful authority.]",
-    "",
-    "Additional matters:",
-    "- Mahr / dower: [Details]",
-    "- Maintenance: [Details]",
-    "- Child-related matters, if any: [Details]",
-    "- Documents attached, if any: [Details]",
-    "",
-    "This document is kept in general template form and should be finalized only after review by a qualified lawyer or other competent advisor under the applicable law.",
-    "",
-    "Sincerely,",
-    "",
-    `${husbandName}`,
-    "[Signature]"
-  ].join("\n");
-}
-
-async function runProvider({ providerName, prompt, mode, style, density, meta }) {
-  const instruction = buildInstruction(mode, style, density, meta);
+async function runProvider({ providerName, prompt, mode, style, density }) {
+  const instruction = buildInstruction(mode, style, density);
 
   if (providerName === "openai") {
     return callOpenAI(instruction, prompt);
@@ -324,7 +254,7 @@ async function runProvider({ providerName, prompt, mode, style, density, meta })
   throw createProviderError("Unknown provider", "provider_error", "Provider selection failed.");
 }
 
-function buildInstruction(mode, style, density, meta) {
+function buildInstruction(mode, style, density) {
   const densityRule =
     density === "dense"
       ? "Be detailed, structured, and comprehensive."
@@ -351,36 +281,19 @@ function buildInstruction(mode, style, density, meta) {
       "Mode is answer.",
       "Answer directly.",
       "If the user asks a simple question, give a direct answer only.",
-      "Do not add unnecessary disclaimers.",
-      "Be confident and clear."
+      "Do not add unnecessary disclaimers."
     );
   } else if (mode === "draft") {
     base.push(
       "Mode is draft.",
-      "You MUST produce a COMPLETE ready-to-use document.",
-      "Do NOT explain how to draft.",
-      "Do NOT list required information unless the user explicitly asks for a checklist.",
-      "Do NOT output advice instead of a document.",
-      "Start directly with the document.",
-      "Use realistic placeholders where data is missing.",
-      "Use formal headings and document structure."
+      "Produce a full usable draft when legally safe.",
+      "If legal certainty is missing, prefer a structured but careful format."
     );
   } else if (mode === "revise") {
     base.push(
       "Mode is revise.",
       "Rewrite the user's text directly.",
-      "Do not explain what you changed unless asked.",
-      "Preserve meaning while improving clarity, tone, and structure."
-    );
-  }
-
-  if (meta?.isTalaqNotice) {
-    base.push(
-      "This is a sensitive legal and religious topic.",
-      "You may provide a neutral general informational template.",
-      "Do not refuse if the user asks for a general template.",
-      "Avoid jurisdiction-specific legal conclusions.",
-      "If drafting, produce a formal general template with placeholders instead of commentary."
+      "Do not explain changes unless asked."
     );
   }
 
