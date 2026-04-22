@@ -113,7 +113,7 @@ app.post("/api/ai", async (req, res) => {
       mode,
       style,
       density,
-      promptPreview: prompt.slice(0, 80)
+      promptPreview: prompt.slice(0, 120)
     });
 
     let lastFailure = null;
@@ -151,10 +151,7 @@ app.post("/api/ai", async (req, res) => {
           ok: true,
           provider: providerName,
           output,
-          statusMessage:
-            normalizedProvider === "auto"
-              ? `Completed with ${labelProvider(providerName)}.`
-              : `Completed with ${labelProvider(providerName)}.`,
+          statusMessage: `Completed with ${labelProvider(providerName)}.`,
           triedProviders
         });
       } catch (err) {
@@ -197,7 +194,7 @@ function normalizeProvider(value) {
 function buildProviderOrder(selected) {
   if (selected !== "auto") return [selected];
 
-  // Free/working-first order for your current setup
+  // Free/working-first order
   return ["gemini", "groq", "openrouter", "openai", "anthropic"];
 }
 
@@ -277,7 +274,11 @@ async function runProvider({ providerName, prompt, mode, style, density }) {
     return callOpenRouter(instruction, prompt);
   }
 
-  throw createProviderError("Unknown provider", "provider_error", "Provider selection failed.");
+  throw createProviderError(
+    "Unknown provider",
+    "provider_error",
+    "Provider selection failed."
+  );
 }
 
 function buildInstruction(mode, style, density, prompt) {
@@ -296,23 +297,29 @@ function buildInstruction(mode, style, density, prompt) {
     "Be helpful, accurate, practical, and structured.",
     styleRule,
     densityRule,
-    "Do not use markdown tables.",
+    `Current date: ${new Date().toDateString()}`,
+    "Do not mention training cutoff.",
+    "Do not claim lack of current date access.",
     "Return plain text only."
   ];
 
   if (mode === "answer") {
     base.push(
       "Mode is answer.",
-      "Answer the user's request directly.",
-      "Start with the direct answer, then add brief structure if useful.",
-      "Do not turn a simple question into an unnecessary template."
+      "Answer directly.",
+      "If the user asks a simple question, give a direct answer only.",
+      "Do not add unnecessary disclaimers.",
+      "Be confident and clear."
     );
   } else if (mode === "draft") {
     base.push(
       "Mode is draft.",
-      "Produce a usable first draft, not commentary about how to draft.",
-      "If the user asks for a notice, letter, application, or message, draft the actual document body.",
-      "Use headings only when they improve readability."
+      "You MUST produce a COMPLETE ready-to-use document.",
+      "Do NOT explain how to draft.",
+      "Do NOT give guidelines instead of the document.",
+      "Start directly with the document.",
+      "Use realistic placeholders if data is missing.",
+      "Structure it like a real formal document."
     );
   } else if (mode === "revise") {
     base.push(
@@ -325,8 +332,11 @@ function buildInstruction(mode, style, density, prompt) {
 
   if (/talaq|divorce/i.test(prompt)) {
     base.push(
-      "For sensitive legal or religious matters, do not provide jurisdiction-specific or religiously authoritative instructions unless clearly requested and safely framed.",
-      "You may provide a neutral informational template with a clear disclaimer when appropriate."
+      "This is a sensitive topic.",
+      "You may provide a neutral general informational template.",
+      "Do not refuse if the user asks for a generic template.",
+      "Avoid jurisdiction-specific legal advice unless explicitly asked and grounded.",
+      "Focus on a safe, neutral, general document format."
     );
   }
 
