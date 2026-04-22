@@ -1,7 +1,12 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { detectLegalIntent, getLegalFrame } from "./legal-frames.js";
+import {
+  detectDraftIntent,
+  getLawSuggestion,
+  buildLawFramedInstruction,
+  buildGeneralDraftInstruction
+} from "./draft-policy.js";
 
 dotenv.config();
 
@@ -39,7 +44,7 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     app: "zhuxin-ai-backend",
-    message: "Legal-aware multi-provider backend is running"
+    message: "Draft-confirmation multi-provider backend is running"
   });
 });
 
@@ -71,18 +76,56 @@ app.post("/api/ai", async (req, res) => {
       mode = "answer",
       style = "clear",
       density = "balanced",
-      provider = "auto"
+      provider = "auto",
+      draftTypeChoice = "",
+      draftPreference = ""
     } = req.body || {};
 
     if (!String(prompt).trim()) {
       return res.status(400).json({ error: "Prompt is required" });
     }
 
-    const legalAnalysis = analyzeLegalRequest({
-      prompt,
-      mode,
-      jurisdiction: "BD"
-    });
+    const intent = detectDraftIntent(prompt, mode, draftTypeChoice);
+    const suggestion = getLawSuggestion(intent.kind);
+
+    if (mode === "draft" && intent.ambiguous) {
+      return res.json({
+        ok: true,
+        provider: "system",
+        actionRequired: true,
+        actionType: "choose_draft_type",
+        originalPrompt: prompt,
+        message: intent.question,
+        options: intent.options || []
+      });
+    }
+
+    if (
+      mode === "draft" &&
+      !intent.ambiguous &&
+      suggestion.available &&
+      !draftPreference
+    ) {
+      return res.json({
+        ok: true,
+        provider: "system",
+        actionRequired: true,
+        actionType: "confirm_draft_preference",
+        originalPrompt: prompt,
+        draftTypeChoice: intent.kind,
+        message: [
+          `${suggestion.title}: ${suggestion.summary}`,
+          "",
+          `Suggested law / frame: ${suggestion.law}`,
+          "",
+          "Do you want to continue with the suggested law-framed draft, or generate a general draft?"
+        ].join("\n"),
+        options: [
+          { id: "law_framed", label: "Use suggested law frame" },
+          { id: "general_draft", label: "General draft" }
+        ]
+      });
+    }
 
     const normalizedProvider = normalizeProvider(provider);
     const providerOrder = buildProviderOrder(normalizedProvider);
@@ -101,13 +144,20 @@ app.post("/api/ai", async (req, res) => {
       }
 
       try {
-        const output = await runProvider({
-          providerName,
+        const instructions = buildInstructions({
           prompt,
           mode,
           style,
           density,
-          legalAnalysis
+          intent,
+          suggestion,
+          draftPreference
+        });
+
+        const output = await runProvider({
+          providerName,
+          prompt,
+          instructions
         });
 
         markProviderSuccess(providerName);
@@ -116,10 +166,7 @@ app.post("/api/ai", async (req, res) => {
           ok: true,
           provider: providerName,
           output,
-          statusMessage:
-            legalAnalysis.isLegalDraftRequest && legalAnalysis.statusMessage
-              ? `${legalAnalysis.statusMessage} Completed with ${labelProvider(providerName)}.`
-              : `Completed with ${labelProvider(providerName)}.`,
+          statusMessage: `Completed with ${labelProvider(providerName)}.`,
           triedProviders
         });
       } catch (err) {
@@ -146,54 +193,44 @@ app.post("/api/ai", async (req, res) => {
   }
 });
 
-function analyzeLegalRequest({ prompt = "", mode = "answer", jurisdiction = "BD" }) {
-  const intent = detectLegalIntent(prompt);
-  const frame = getLegalFrame(intent);
+function buildInstructions({ prompt, mode, style, density, intent, suggestion, draftPreference }) {
+  const densityRule =
+    density === "dense"
+      ? "Be detailed, structured, and comprehensive."
+      : "Be concise but complete.";
 
-  const isLegalDraftRequest =
-    mode === "draft" &&
-    /(notice|plaint|petition|application|affidavit|complaint|deed|agreement|talaq|divorce|party)/i.test(prompt);
+  const styleRule =
+    style === "formal"
+      ? "Use formal professional tone."
+      : "Use clear natural tone.";
 
-  if (!isLegalDraftRequest) {
-    return {
-      isLegalDraftRequest: false,
-      legalFramePrompt: "",
-      statusMessage: ""
-    };
+  if (mode === "draft" && draftPreference === "law_framed") {
+    return [
+      styleRule,
+      densityRule,
+      `Current date: ${new Date().toDateString()}`,
+      buildLawFramedInstruction(prompt, intent, suggestion)
+    ].join("\n");
   }
 
-  if (!frame) {
-    return {
-      isLegalDraftRequest: true,
-      legalFramePrompt: [
-        "This is a legal drafting request.",
-        "Law is above all.",
-        "Do not draft in a legally random way.",
-        "Preserve core legal structure and avoid wrong authority or wrong procedural route."
-      ].join("\n"),
-      statusMessage: "Legal drafting mode applied."
-    };
+  if (mode === "draft" && draftPreference === "general_draft") {
+    return [
+      styleRule,
+      densityRule,
+      `Current date: ${new Date().toDateString()}`,
+      buildGeneralDraftInstruction(prompt, intent, suggestion)
+    ].join("\n");
   }
 
-  const frameText = [
-    `Jurisdiction: ${jurisdiction}`,
-    `Detected legal type: ${intent}`,
-    `Law context: ${frame.law || "N/A"}`,
-    "Mandatory structural elements:",
-    ...(frame.mustHave || []).map((x) => `- ${x}`),
-    ...(frame.rules ? ["Legal direction rules:", ...frame.rules.map((x) => `- ${x}`)] : []),
-    ...(frame.criticalQuestion ? [`If legally necessary, ask this single clarifying question: ${frame.criticalQuestion}`] : []),
-    "Draft naturally and intelligently, not robotically.",
-    "Do not collapse into a useless static template.",
-    "If a core legal direction is fatally unclear, ask one targeted question.",
-    "Otherwise generate a full refined draft."
+  return [
+    "You are Zhuxin Assistant.",
+    styleRule,
+    densityRule,
+    `Current date: ${new Date().toDateString()}`,
+    "Answer directly and naturally.",
+    "Do not be robotic.",
+    `User request: ${prompt}`
   ].join("\n");
-
-  return {
-    isLegalDraftRequest: true,
-    legalFramePrompt: frameText,
-    statusMessage: `Legal frame matched for ${intent}.`
-  };
 }
 
 function normalizeProvider(value) {
@@ -250,9 +287,7 @@ function getCooldownMs(err) {
   return 2 * 60 * 1000;
 }
 
-async function runProvider({ providerName, prompt, mode, style, density, legalAnalysis }) {
-  const instructions = buildInstruction(mode, style, density, prompt, legalAnalysis);
-
+async function runProvider({ providerName, prompt, instructions }) {
   if (providerName === "openai") return callOpenAI(instructions, prompt);
   if (providerName === "gemini") return callGemini(instructions, prompt);
   if (providerName === "groq") return callGroq(instructions, prompt);
@@ -260,66 +295,6 @@ async function runProvider({ providerName, prompt, mode, style, density, legalAn
   if (providerName === "openrouter") return callOpenRouter(instructions, prompt);
 
   throw createProviderError("Unknown provider", "provider_error", "Provider selection failed.");
-}
-
-function buildInstruction(mode, style, density, prompt, legalAnalysis) {
-  const densityRule =
-    density === "dense"
-      ? "Be detailed, structured, and comprehensive."
-      : "Be concise but complete.";
-
-  const styleRule =
-    style === "formal"
-      ? "Use formal professional tone."
-      : "Use clear natural tone.";
-
-  const parts = [
-    "You are Zhuxin Assistant.",
-    "Law is above all.",
-    styleRule,
-    densityRule,
-    `Current date: ${new Date().toDateString()}`,
-    "Do not mention training cutoff.",
-    "Do not say you lack current date access.",
-    "Return plain text only."
-  ];
-
-  if (mode === "answer") {
-    parts.push(
-      "Mode: answer.",
-      "Answer directly and clearly.",
-      "If the question is simple, keep it direct."
-    );
-  }
-
-  if (mode === "revise") {
-    parts.push(
-      "Mode: revise.",
-      "Rewrite directly.",
-      "Do not explain edits unless asked."
-    );
-  }
-
-  if (mode === "draft") {
-    parts.push(
-      "Mode: draft.",
-      "Draft naturally and intelligently.",
-      "Do not become robotic.",
-      "Do not use a dead repetitive template.",
-      "Follow law and mandatory structure first, then draft freely with good professional quality.",
-      "Ask one targeted clarifying question only if a missing fact would make the document legally misdirected or structurally defective.",
-      "Otherwise generate a complete draft."
-    );
-  }
-
-  if (legalAnalysis?.isLegalDraftRequest) {
-    parts.push("This is a legal drafting request.");
-    parts.push(legalAnalysis.legalFramePrompt || "");
-  }
-
-  parts.push(`User request: ${prompt}`);
-
-  return parts.filter(Boolean).join("\n");
 }
 
 async function callOpenAI(instructions, prompt) {
@@ -482,5 +457,5 @@ async function safeJson(response) {
 }
 
 app.listen(PORT, () => {
-  console.log(`Zhuxin legal-aware multi-provider backend listening on port ${PORT}`);
+  console.log(`Zhuxin draft-confirmation backend listening on port ${PORT}`);
 });
