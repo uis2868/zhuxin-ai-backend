@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { analyzeLegalRequest } from "./legal-rules-engine.js";
+import { detectLegalIntent, getLegalFrame } from "./legal-frames.js";
 
 dotenv.config();
 
@@ -146,6 +146,56 @@ app.post("/api/ai", async (req, res) => {
   }
 });
 
+function analyzeLegalRequest({ prompt = "", mode = "answer", jurisdiction = "BD" }) {
+  const intent = detectLegalIntent(prompt);
+  const frame = getLegalFrame(intent);
+
+  const isLegalDraftRequest =
+    mode === "draft" &&
+    /(notice|plaint|petition|application|affidavit|complaint|deed|agreement|talaq|divorce|party)/i.test(prompt);
+
+  if (!isLegalDraftRequest) {
+    return {
+      isLegalDraftRequest: false,
+      legalFramePrompt: "",
+      statusMessage: ""
+    };
+  }
+
+  if (!frame) {
+    return {
+      isLegalDraftRequest: true,
+      legalFramePrompt: [
+        "This is a legal drafting request.",
+        "Law is above all.",
+        "Do not draft in a legally random way.",
+        "Preserve core legal structure and avoid wrong authority or wrong procedural route."
+      ].join("\n"),
+      statusMessage: "Legal drafting mode applied."
+    };
+  }
+
+  const frameText = [
+    `Jurisdiction: ${jurisdiction}`,
+    `Detected legal type: ${intent}`,
+    `Law context: ${frame.law || "N/A"}`,
+    "Mandatory structural elements:",
+    ...(frame.mustHave || []).map((x) => `- ${x}`),
+    ...(frame.rules ? ["Legal direction rules:", ...frame.rules.map((x) => `- ${x}`)] : []),
+    ...(frame.criticalQuestion ? [`If legally necessary, ask this single clarifying question: ${frame.criticalQuestion}`] : []),
+    "Draft naturally and intelligently, not robotically.",
+    "Do not collapse into a useless static template.",
+    "If a core legal direction is fatally unclear, ask one targeted question.",
+    "Otherwise generate a full refined draft."
+  ].join("\n");
+
+  return {
+    isLegalDraftRequest: true,
+    legalFramePrompt: frameText,
+    statusMessage: `Legal frame matched for ${intent}.`
+  };
+}
+
 function normalizeProvider(value) {
   const v = String(value || "auto").toLowerCase().trim();
   const allowed = ["auto", "openai", "gemini", "groq", "anthropic", "openrouter"];
@@ -238,7 +288,7 @@ function buildInstruction(mode, style, density, prompt, legalAnalysis) {
     parts.push(
       "Mode: answer.",
       "Answer directly and clearly.",
-      "If the question is simple, keep the answer direct."
+      "If the question is simple, keep it direct."
     );
   }
 
@@ -253,19 +303,18 @@ function buildInstruction(mode, style, density, prompt, legalAnalysis) {
   if (mode === "draft") {
     parts.push(
       "Mode: draft.",
-      "Draft freely and intelligently, but never against law.",
-      "Do not randomly choose the wrong authority, wrong recipient, wrong procedural route, or omit essential structural parts.",
-      "Do not collapse into a rigid template unless necessary.",
-      "Use the legal frame as the minimum required structure, then improve the drafting quality beyond that."
+      "Draft naturally and intelligently.",
+      "Do not become robotic.",
+      "Do not use a dead repetitive template.",
+      "Follow law and mandatory structure first, then draft freely with good professional quality.",
+      "Ask one targeted clarifying question only if a missing fact would make the document legally misdirected or structurally defective.",
+      "Otherwise generate a complete draft."
     );
   }
 
   if (legalAnalysis?.isLegalDraftRequest) {
     parts.push("This is a legal drafting request.");
     parts.push(legalAnalysis.legalFramePrompt || "");
-    parts.push(
-      "If a core legal direction is genuinely unclear, state the assumption carefully within the draft rather than inventing an obviously wrong route."
-    );
   }
 
   parts.push(`User request: ${prompt}`);
@@ -316,7 +365,6 @@ async function callGemini(instructions, prompt) {
 
   const data = await safeJson(response);
   ensureOk(response, data);
-
   return data?.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("") || "";
 }
 
@@ -353,9 +401,7 @@ async function callAnthropic(instructions, prompt) {
       model: MODELS.anthropic,
       max_tokens: 1024,
       system: instructions,
-      messages: [
-        { role: "user", content: prompt }
-      ]
+      messages: [{ role: "user", content: prompt }]
     })
   });
 
