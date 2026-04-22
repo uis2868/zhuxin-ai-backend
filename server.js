@@ -24,36 +24,11 @@ const MODELS = {
 };
 
 const providerState = {
-  openai: {
-    available: !!KEYS.openai,
-    reason: !!KEYS.openai ? null : "missing_key",
-    retryAt: null,
-    lastError: null
-  },
-  gemini: {
-    available: !!KEYS.gemini,
-    reason: !!KEYS.gemini ? null : "missing_key",
-    retryAt: null,
-    lastError: null
-  },
-  groq: {
-    available: !!KEYS.groq,
-    reason: !!KEYS.groq ? null : "missing_key",
-    retryAt: null,
-    lastError: null
-  },
-  anthropic: {
-    available: !!KEYS.anthropic,
-    reason: !!KEYS.anthropic ? null : "missing_key",
-    retryAt: null,
-    lastError: null
-  },
-  openrouter: {
-    available: !!KEYS.openrouter,
-    reason: !!KEYS.openrouter ? null : "missing_key",
-    retryAt: null,
-    lastError: null
-  }
+  openai: { available: !!KEYS.openai, reason: !!KEYS.openai ? null : "missing_key", retryAt: null, lastError: null },
+  gemini: { available: !!KEYS.gemini, reason: !!KEYS.gemini ? null : "missing_key", retryAt: null, lastError: null },
+  groq: { available: !!KEYS.groq, reason: !!KEYS.groq ? null : "missing_key", retryAt: null, lastError: null },
+  anthropic: { available: !!KEYS.anthropic, reason: !!KEYS.anthropic ? null : "missing_key", retryAt: null, lastError: null },
+  openrouter: { available: !!KEYS.openrouter, reason: !!KEYS.openrouter ? null : "missing_key", retryAt: null, lastError: null }
 };
 
 app.use(cors());
@@ -108,13 +83,7 @@ app.post("/api/ai", async (req, res) => {
     const normalizedProvider = normalizeProvider(provider);
     const providerOrder = buildProviderOrder(normalizedProvider);
 
-    console.log("[REQUEST]", {
-      provider: normalizedProvider,
-      mode,
-      style,
-      density,
-      promptPreview: prompt.slice(0, 120)
-    });
+    const prepared = preparePrompt(prompt, mode);
 
     let lastFailure = null;
     const triedProviders = [];
@@ -130,22 +99,23 @@ app.post("/api/ai", async (req, res) => {
       }
 
       try {
-        const output = await runProvider({
-          providerName,
-          prompt,
-          mode,
-          style,
-          density
-        });
+        let output;
+
+        // hard-coded safe template path for sensitive notice drafting
+        if (prepared.forceLocalTemplate) {
+          output = buildLocalTemplate(prepared);
+        } else {
+          output = await runProvider({
+            providerName,
+            prompt: prepared.prompt,
+            mode,
+            style,
+            density,
+            meta: prepared
+          });
+        }
 
         markProviderSuccess(providerName);
-
-        console.log("[SUCCESS]", {
-          provider: providerName,
-          mode,
-          style,
-          density
-        });
 
         return res.json({
           ok: true,
@@ -163,12 +133,6 @@ app.post("/api/ai", async (req, res) => {
           skipped: false,
           reason: err.reason || "provider_error",
           message: err.publicMessage || err.message || "Provider failed"
-        });
-
-        console.log("[FAILURE]", {
-          provider: providerName,
-          reason: err.reason,
-          message: err.message
         });
       }
     }
@@ -193,8 +157,6 @@ function normalizeProvider(value) {
 
 function buildProviderOrder(selected) {
   if (selected !== "auto") return [selected];
-
-  // Free/working-first order
   return ["gemini", "groq", "openrouter", "openai", "anthropic"];
 }
 
@@ -255,8 +217,93 @@ function getCooldownMs(err) {
   return 2 * 60 * 1000;
 }
 
-async function runProvider({ providerName, prompt, mode, style, density }) {
-  const instruction = buildInstruction(mode, style, density, prompt);
+function preparePrompt(rawPrompt, mode) {
+  const prompt = String(rawPrompt || "").trim();
+  const lower = prompt.toLowerCase();
+
+  const isTalaqNotice =
+    /talaq/.test(lower) ||
+    (/notice/.test(lower) && /divorce/.test(lower));
+
+  const extracted = {
+    wifeName: extractAfter(prompt, ["wife name is", "name is", "wife is"]),
+    husbandName: extractAfter(prompt, ["husband name is", "husband is"]),
+    keepBlank: /rest leave as blank|leave rest as blank|keep rest blank/i.test(prompt)
+  };
+
+  return {
+    prompt,
+    isTalaqNotice,
+    forceLocalTemplate: mode === "draft" && isTalaqNotice,
+    extracted
+  };
+}
+
+function extractAfter(text, patterns) {
+  for (const pattern of patterns) {
+    const re = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s+([A-Za-z .'-]+)", "i");
+    const match = text.match(re);
+    if (match && match[1]) return match[1].trim();
+  }
+  return "";
+}
+
+function buildLocalTemplate(prepared) {
+  const wifeName = prepared.extracted.wifeName || "[Wife Name]";
+  const husbandName = prepared.extracted.husbandName || "[Husband Name]";
+
+  return [
+    "GENERAL INFORMATIONAL TEMPLATE ONLY",
+    "This is a neutral general draft for informational use. Local law, court procedure, registration requirements, and religious rules may differ.",
+    "",
+    "NOTICE OF INTENTION / DECLARATION RELATING TO TALAQ",
+    "",
+    "From:",
+    `${husbandName}`,
+    "[Address]",
+    "[Phone Number]",
+    "",
+    "To:",
+    `${wifeName}`,
+    "[Address]",
+    "",
+    "Date:",
+    "[Date]",
+    "",
+    "Subject: Notice relating to talaq",
+    "",
+    "Dear " + wifeName + ",",
+    "",
+    "This notice is being issued as a general written communication regarding talaq. The details, legal effect, procedural requirements, date of effectiveness, and any registration or notice obligations shall be governed by the applicable law and competent authority.",
+    "",
+    "For record purposes, the relevant details are stated below:",
+    "1. Husband's name: " + husbandName,
+    "2. Wife's name: " + wifeName,
+    "3. Date of marriage: [Date of Marriage]",
+    "4. Place of marriage: [Place of Marriage]",
+    "5. Address of husband: [Husband Address]",
+    "6. Address of wife: [Wife Address]",
+    "",
+    "Statement:",
+    "[Insert the intended statement here in the exact form advised by your qualified lawyer / lawful authority.]",
+    "",
+    "Additional matters:",
+    "- Mahr / dower: [Details]",
+    "- Maintenance: [Details]",
+    "- Child-related matters, if any: [Details]",
+    "- Documents attached, if any: [Details]",
+    "",
+    "This document is kept in general template form and should be finalized only after review by a qualified lawyer or other competent advisor under the applicable law.",
+    "",
+    "Sincerely,",
+    "",
+    `${husbandName}`,
+    "[Signature]"
+  ].join("\n");
+}
+
+async function runProvider({ providerName, prompt, mode, style, density, meta }) {
+  const instruction = buildInstruction(mode, style, density, meta);
 
   if (providerName === "openai") {
     return callOpenAI(instruction, prompt);
@@ -274,14 +321,10 @@ async function runProvider({ providerName, prompt, mode, style, density }) {
     return callOpenRouter(instruction, prompt);
   }
 
-  throw createProviderError(
-    "Unknown provider",
-    "provider_error",
-    "Provider selection failed."
-  );
+  throw createProviderError("Unknown provider", "provider_error", "Provider selection failed.");
 }
 
-function buildInstruction(mode, style, density, prompt) {
+function buildInstruction(mode, style, density, meta) {
   const densityRule =
     density === "dense"
       ? "Be detailed, structured, and comprehensive."
@@ -316,27 +359,28 @@ function buildInstruction(mode, style, density, prompt) {
       "Mode is draft.",
       "You MUST produce a COMPLETE ready-to-use document.",
       "Do NOT explain how to draft.",
-      "Do NOT give guidelines instead of the document.",
+      "Do NOT list required information unless the user explicitly asks for a checklist.",
+      "Do NOT output advice instead of a document.",
       "Start directly with the document.",
-      "Use realistic placeholders if data is missing.",
-      "Structure it like a real formal document."
+      "Use realistic placeholders where data is missing.",
+      "Use formal headings and document structure."
     );
   } else if (mode === "revise") {
     base.push(
       "Mode is revise.",
       "Rewrite the user's text directly.",
-      "Do not explain what you changed unless the user asks.",
+      "Do not explain what you changed unless asked.",
       "Preserve meaning while improving clarity, tone, and structure."
     );
   }
 
-  if (/talaq|divorce/i.test(prompt)) {
+  if (meta?.isTalaqNotice) {
     base.push(
-      "This is a sensitive topic.",
+      "This is a sensitive legal and religious topic.",
       "You may provide a neutral general informational template.",
-      "Do not refuse if the user asks for a generic template.",
-      "Avoid jurisdiction-specific legal advice unless explicitly asked and grounded.",
-      "Focus on a safe, neutral, general document format."
+      "Do not refuse if the user asks for a general template.",
+      "Avoid jurisdiction-specific legal conclusions.",
+      "If drafting, produce a formal general template with placeholders instead of commentary."
     );
   }
 
