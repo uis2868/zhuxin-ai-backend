@@ -44,7 +44,7 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     app: "zhuxin-ai-backend",
-    message: "Draft-confirmation multi-provider backend is running"
+    message: "Workflow-memory backend is running"
   });
 });
 
@@ -78,52 +78,49 @@ app.post("/api/ai", async (req, res) => {
       density = "balanced",
       provider = "auto",
       draftTypeChoice = "",
-      draftPreference = ""
+      draftPreference = "",
+      workflowState = null
     } = req.body || {};
 
     if (!String(prompt).trim()) {
       return res.status(400).json({ error: "Prompt is required" });
     }
 
-    const intent = detectDraftIntent(prompt, mode, draftTypeChoice);
-    const suggestion = getLawSuggestion(intent.kind);
+    const mergedWorkflow = buildNextWorkflowState({
+      prompt,
+      mode,
+      draftTypeChoice,
+      draftPreference,
+      workflowState
+    });
 
-    if (mode === "draft" && intent.ambiguous) {
+    if (mode === "draft" && mergedWorkflow.stage === "choose_draft_type") {
       return res.json({
         ok: true,
         provider: "system",
         actionRequired: true,
         actionType: "choose_draft_type",
-        originalPrompt: prompt,
-        message: intent.question,
-        options: intent.options || []
+        originalPrompt: mergedWorkflow.originalPrompt || prompt,
+        message: mergedWorkflow.pendingQuestion,
+        options: mergedWorkflow.options || [],
+        workflowState: mergedWorkflow
       });
     }
 
-    if (
-      mode === "draft" &&
-      !intent.ambiguous &&
-      suggestion.available &&
-      !draftPreference
-    ) {
+    if (mode === "draft" && mergedWorkflow.stage === "confirm_draft_preference") {
       return res.json({
         ok: true,
         provider: "system",
         actionRequired: true,
         actionType: "confirm_draft_preference",
-        originalPrompt: prompt,
-        draftTypeChoice: intent.kind,
-        message: [
-          `${suggestion.title}: ${suggestion.summary}`,
-          "",
-          `Suggested law / frame: ${suggestion.law}`,
-          "",
-          "Do you want to continue with the suggested law-framed draft, or generate a general draft?"
-        ].join("\n"),
+        originalPrompt: mergedWorkflow.originalPrompt || prompt,
+        draftTypeChoice: mergedWorkflow.draftType,
+        message: mergedWorkflow.pendingQuestion,
         options: [
           { id: "law_framed", label: "Use suggested law frame" },
           { id: "general_draft", label: "General draft" }
-        ]
+        ],
+        workflowState: mergedWorkflow
       });
     }
 
@@ -149,25 +146,32 @@ app.post("/api/ai", async (req, res) => {
           mode,
           style,
           density,
-          intent,
-          suggestion,
-          draftPreference
+          workflow: mergedWorkflow
         });
 
         const output = await runProvider({
           providerName,
-          prompt,
+          prompt: buildProviderPrompt(prompt, mergedWorkflow),
           instructions
         });
 
         markProviderSuccess(providerName);
+
+        const finalWorkflow = {
+          ...mergedWorkflow,
+          active: mode === "draft",
+          stage: mode === "draft" ? "drafting" : "completed",
+          pendingQuestion: "",
+          lastDraft: output
+        };
 
         return res.json({
           ok: true,
           provider: providerName,
           output,
           statusMessage: `Completed with ${labelProvider(providerName)}.`,
-          triedProviders
+          triedProviders,
+          workflowState: finalWorkflow
         });
       } catch (err) {
         lastFailure = err;
@@ -184,7 +188,8 @@ app.post("/api/ai", async (req, res) => {
 
     return res.status(503).json({
       error: lastFailure?.publicMessage || "No AI provider is currently available.",
-      triedProviders
+      triedProviders,
+      workflowState: mergedWorkflow
     });
   } catch (err) {
     return res.status(500).json({
@@ -193,7 +198,166 @@ app.post("/api/ai", async (req, res) => {
   }
 });
 
-function buildInstructions({ prompt, mode, style, density, intent, suggestion, draftPreference }) {
+function buildNextWorkflowState({
+  prompt,
+  mode,
+  draftTypeChoice,
+  draftPreference,
+  workflowState
+}) {
+  const previous = normalizeWorkflow(workflowState);
+  const extractedFacts = extractFacts(prompt);
+
+  if (mode !== "draft") {
+    return {
+      active: false,
+      stage: "none",
+      draftType: "",
+      draftPreference: "",
+      facts: {},
+      pendingQuestion: "",
+      originalPrompt: "",
+      options: [],
+      suggestedLaw: null,
+      lastDraft: ""
+    };
+  }
+
+  const effectivePrompt = previous.originalPrompt || prompt;
+  const effectiveDraftTypeChoice = draftTypeChoice || previous.draftType || "";
+  const intent = detectDraftIntent(effectivePrompt, mode, effectiveDraftTypeChoice);
+  const suggestion = getLawSuggestion(intent.kind);
+
+  const mergedFacts = {
+    ...(previous.facts || {}),
+    ...cleanObject(extractedFacts)
+  };
+
+  let stage = previous.stage || "start";
+  let pendingQuestion = "";
+  let options = [];
+  let chosenPreference = draftPreference || previous.draftPreference || "";
+
+  if (intent.ambiguous) {
+    stage = "choose_draft_type";
+    pendingQuestion = intent.question || "What kind of draft do you need?";
+    options = intent.options || [];
+  } else if (!chosenPreference && suggestion.available) {
+    stage = "confirm_draft_preference";
+    pendingQuestion = [
+      `${suggestion.title}: ${suggestion.summary}`,
+      "",
+      `Suggested law / frame: ${suggestion.law}`,
+      "",
+      "Do you want to continue with the suggested law-framed draft, or generate a general draft?"
+    ].join("\n");
+  } else {
+    stage = "drafting";
+  }
+
+  return {
+    active: true,
+    stage,
+    draftType: intent.kind || previous.draftType || "",
+    draftLabel: intent.label || previous.draftLabel || "",
+    draftPreference: chosenPreference,
+    facts: mergedFacts,
+    pendingQuestion,
+    options,
+    originalPrompt: effectivePrompt,
+    suggestedLaw: suggestion.available ? suggestion : null,
+    lastDraft: previous.lastDraft || ""
+  };
+}
+
+function normalizeWorkflow(state) {
+  if (!state || typeof state !== "object") {
+    return {
+      active: false,
+      stage: "",
+      draftType: "",
+      draftLabel: "",
+      draftPreference: "",
+      facts: {},
+      pendingQuestion: "",
+      options: [],
+      originalPrompt: "",
+      suggestedLaw: null,
+      lastDraft: ""
+    };
+  }
+
+  return {
+    active: !!state.active,
+    stage: state.stage || "",
+    draftType: state.draftType || "",
+    draftLabel: state.draftLabel || "",
+    draftPreference: state.draftPreference || "",
+    facts: state.facts || {},
+    pendingQuestion: state.pendingQuestion || "",
+    options: Array.isArray(state.options) ? state.options : [],
+    originalPrompt: state.originalPrompt || "",
+    suggestedLaw: state.suggestedLaw || null,
+    lastDraft: state.lastDraft || ""
+  };
+}
+
+function extractFacts(text) {
+  const source = String(text || "");
+
+  return {
+    husband_name: capture(source, ["husband name is", "husband is"]),
+    wife_name: capture(source, ["wife name is", "wife is", "wife's name is"]),
+    sender_name: capture(source, ["sender name is", "my name is", "name is"]),
+    recipient_name: capture(source, ["recipient is", "to is"]),
+    court_name: capture(source, ["court is", "court name is"]),
+    provision: capture(source, ["under provision", "u/o", "under order", "under section"]),
+    case_reference: capture(source, ["case no is", "suit no is", "case reference is"]),
+    date: capture(source, ["date is"]),
+    marriage_date: capture(source, ["marriage date is", "date of marriage is"]),
+    marriage_place: capture(source, ["place of marriage is", "marriage place is"]),
+    address_husband: capture(source, ["husband address is"]),
+    address_wife: capture(source, ["wife address is"]),
+    subject: capture(source, ["subject is"]),
+    facts_summary: capture(source, ["facts are", "facts is", "background is"]),
+    relief: capture(source, ["relief is", "prayer is", "demand is"])
+  };
+}
+
+function capture(text, patterns) {
+  for (const pattern of patterns) {
+    const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(escaped + "\\s+([A-Za-z0-9,./()' -]+)", "i");
+    const match = text.match(re);
+    if (match && match[1]) return match[1].trim();
+  }
+  return "";
+}
+
+function cleanObject(obj) {
+  return Object.fromEntries(
+    Object.entries(obj).filter(([, value]) => String(value || "").trim())
+  );
+}
+
+function buildProviderPrompt(latestPrompt, workflow) {
+  if (!workflow || !workflow.active) return latestPrompt;
+
+  const factLines = Object.entries(workflow.facts || {})
+    .map(([k, v]) => `- ${k}: ${v}`)
+    .join("\n");
+
+  return [
+    `Current draft type: ${workflow.draftLabel || workflow.draftType || "N/A"}`,
+    workflow.draftPreference ? `Draft preference: ${workflow.draftPreference}` : "",
+    workflow.originalPrompt ? `Original drafting request: ${workflow.originalPrompt}` : "",
+    factLines ? `Collected facts so far:\n${factLines}` : "",
+    workflow.lastDraft ? `Last draft version:\n${workflow.lastDraft}` : "",
+    `Latest user message:\n${latestPrompt}`
+  ].filter(Boolean).join("\n\n");
+}
+
+function buildInstructions({ prompt, mode, style, density, workflow }) {
   const densityRule =
     density === "dense"
       ? "Be detailed, structured, and comprehensive."
@@ -204,21 +368,36 @@ function buildInstructions({ prompt, mode, style, density, intent, suggestion, d
       ? "Use formal professional tone."
       : "Use clear natural tone.";
 
-  if (mode === "draft" && draftPreference === "law_framed") {
+  if (mode === "draft" && workflow?.draftPreference === "law_framed") {
     return [
       styleRule,
       densityRule,
       `Current date: ${new Date().toDateString()}`,
-      buildLawFramedInstruction(prompt, intent, suggestion)
+      buildLawFramedInstruction(workflow.originalPrompt || prompt, {
+        kind: workflow.draftType,
+        label: workflow.draftLabel
+      }, workflow.suggestedLaw),
+      "This is a continuing drafting session.",
+      "Do not restart from zero.",
+      "Use the collected facts and latest user message together.",
+      "If the user added new facts, update the draft accordingly.",
+      "If information is still missing, use careful placeholders rather than forgetting prior context."
     ].join("\n");
   }
 
-  if (mode === "draft" && draftPreference === "general_draft") {
+  if (mode === "draft" && workflow?.draftPreference === "general_draft") {
     return [
       styleRule,
       densityRule,
       `Current date: ${new Date().toDateString()}`,
-      buildGeneralDraftInstruction(prompt, intent, suggestion)
+      buildGeneralDraftInstruction(workflow.originalPrompt || prompt, {
+        kind: workflow.draftType,
+        label: workflow.draftLabel
+      }, workflow.suggestedLaw),
+      "This is a continuing drafting session.",
+      "Do not restart from zero.",
+      "Use the collected facts and latest user message together.",
+      "If the user added new facts, update the draft accordingly."
     ].join("\n");
   }
 
@@ -457,5 +636,5 @@ async function safeJson(response) {
 }
 
 app.listen(PORT, () => {
-  console.log(`Zhuxin draft-confirmation backend listening on port ${PORT}`);
+  console.log(`Zhuxin workflow-memory backend listening on port ${PORT}`);
 });
