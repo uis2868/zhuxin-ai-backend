@@ -1,10 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import {
-  resolveLegalDraftPolicy,
-  buildRegistryOutput
-} from "./legal-template-registry.js";
+import { analyzeLegalRequest } from "./legal-rules-engine.js";
 
 dotenv.config();
 
@@ -42,13 +39,12 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     app: "zhuxin-ai-backend",
-    message: "Multi-provider backend is running"
+    message: "Legal-aware multi-provider backend is running"
   });
 });
 
 app.get("/health", (_req, res) => {
   refreshAvailabilityByTime();
-
   res.json({
     ok: true,
     providers: Object.fromEntries(
@@ -78,32 +74,15 @@ app.post("/api/ai", async (req, res) => {
       provider = "auto"
     } = req.body || {};
 
-    if (!prompt.trim()) {
-      return res.status(400).json({
-        error: "Prompt is required"
-      });
+    if (!String(prompt).trim()) {
+      return res.status(400).json({ error: "Prompt is required" });
     }
 
-    // LAW > TEMPLATE > CAUTION > AI
-    const legalPolicy = resolveLegalDraftPolicy({
+    const legalAnalysis = analyzeLegalRequest({
       prompt,
       mode,
       jurisdiction: "BD"
     });
-
-    if (legalPolicy.route === "approved_template" || legalPolicy.route === "cautious_skeleton") {
-      const output = buildRegistryOutput(legalPolicy);
-
-      return res.json({
-        ok: true,
-        provider: "registry",
-        output,
-        statusMessage:
-          legalPolicy.route === "approved_template"
-            ? "Completed with approved legal template."
-            : "Completed with cautious legal skeleton. Expert review required."
-      });
-    }
 
     const normalizedProvider = normalizeProvider(provider);
     const providerOrder = buildProviderOrder(normalizedProvider);
@@ -127,7 +106,8 @@ app.post("/api/ai", async (req, res) => {
           prompt,
           mode,
           style,
-          density
+          density,
+          legalAnalysis
         });
 
         markProviderSuccess(providerName);
@@ -136,7 +116,10 @@ app.post("/api/ai", async (req, res) => {
           ok: true,
           provider: providerName,
           output,
-          statusMessage: `Completed with ${labelProvider(providerName)}.`,
+          statusMessage:
+            legalAnalysis.isLegalDraftRequest && legalAnalysis.statusMessage
+              ? `${legalAnalysis.statusMessage} Completed with ${labelProvider(providerName)}.`
+              : `Completed with ${labelProvider(providerName)}.`,
           triedProviders
         });
       } catch (err) {
@@ -154,8 +137,7 @@ app.post("/api/ai", async (req, res) => {
 
     return res.status(503).json({
       error: lastFailure?.publicMessage || "No AI provider is currently available.",
-      triedProviders,
-      providers: summarizeProviders()
+      triedProviders
     });
   } catch (err) {
     return res.status(500).json({
@@ -196,20 +178,6 @@ function refreshAvailabilityByTime() {
   }
 }
 
-function summarizeProviders() {
-  return Object.fromEntries(
-    Object.entries(providerState).map(([name, state]) => [
-      name,
-      {
-        available: isProviderUsable(name),
-        reason: state.reason,
-        retryAt: state.retryAt,
-        lastError: state.lastError
-      }
-    ])
-  );
-}
-
 function markProviderSuccess(name) {
   providerState[name].available = true;
   providerState[name].reason = null;
@@ -232,29 +200,19 @@ function getCooldownMs(err) {
   return 2 * 60 * 1000;
 }
 
-async function runProvider({ providerName, prompt, mode, style, density }) {
-  const instruction = buildInstruction(mode, style, density);
+async function runProvider({ providerName, prompt, mode, style, density, legalAnalysis }) {
+  const instructions = buildInstruction(mode, style, density, prompt, legalAnalysis);
 
-  if (providerName === "openai") {
-    return callOpenAI(instruction, prompt);
-  }
-  if (providerName === "gemini") {
-    return callGemini(instruction, prompt);
-  }
-  if (providerName === "groq") {
-    return callGroq(instruction, prompt);
-  }
-  if (providerName === "anthropic") {
-    return callAnthropic(instruction, prompt);
-  }
-  if (providerName === "openrouter") {
-    return callOpenRouter(instruction, prompt);
-  }
+  if (providerName === "openai") return callOpenAI(instructions, prompt);
+  if (providerName === "gemini") return callGemini(instructions, prompt);
+  if (providerName === "groq") return callGroq(instructions, prompt);
+  if (providerName === "anthropic") return callAnthropic(instructions, prompt);
+  if (providerName === "openrouter") return callOpenRouter(instructions, prompt);
 
   throw createProviderError("Unknown provider", "provider_error", "Provider selection failed.");
 }
 
-function buildInstruction(mode, style, density) {
+function buildInstruction(mode, style, density, prompt, legalAnalysis) {
   const densityRule =
     density === "dense"
       ? "Be detailed, structured, and comprehensive."
@@ -265,39 +223,54 @@ function buildInstruction(mode, style, density) {
       ? "Use formal professional tone."
       : "Use clear natural tone.";
 
-  const base = [
+  const parts = [
     "You are Zhuxin Assistant.",
-    "Be helpful, accurate, practical, and structured.",
+    "Law is above all.",
     styleRule,
     densityRule,
     `Current date: ${new Date().toDateString()}`,
     "Do not mention training cutoff.",
-    "Do not claim lack of current date access.",
+    "Do not say you lack current date access.",
     "Return plain text only."
   ];
 
   if (mode === "answer") {
-    base.push(
-      "Mode is answer.",
-      "Answer directly.",
-      "If the user asks a simple question, give a direct answer only.",
-      "Do not add unnecessary disclaimers."
-    );
-  } else if (mode === "draft") {
-    base.push(
-      "Mode is draft.",
-      "Produce a full usable draft when legally safe.",
-      "If legal certainty is missing, prefer a structured but careful format."
-    );
-  } else if (mode === "revise") {
-    base.push(
-      "Mode is revise.",
-      "Rewrite the user's text directly.",
-      "Do not explain changes unless asked."
+    parts.push(
+      "Mode: answer.",
+      "Answer directly and clearly.",
+      "If the question is simple, keep the answer direct."
     );
   }
 
-  return base.join("\n");
+  if (mode === "revise") {
+    parts.push(
+      "Mode: revise.",
+      "Rewrite directly.",
+      "Do not explain edits unless asked."
+    );
+  }
+
+  if (mode === "draft") {
+    parts.push(
+      "Mode: draft.",
+      "Draft freely and intelligently, but never against law.",
+      "Do not randomly choose the wrong authority, wrong recipient, wrong procedural route, or omit essential structural parts.",
+      "Do not collapse into a rigid template unless necessary.",
+      "Use the legal frame as the minimum required structure, then improve the drafting quality beyond that."
+    );
+  }
+
+  if (legalAnalysis?.isLegalDraftRequest) {
+    parts.push("This is a legal drafting request.");
+    parts.push(legalAnalysis.legalFramePrompt || "");
+    parts.push(
+      "If a core legal direction is genuinely unclear, state the assumption carefully within the draft rather than inventing an obviously wrong route."
+    );
+  }
+
+  parts.push(`User request: ${prompt}`);
+
+  return parts.filter(Boolean).join("\n");
 }
 
 async function callOpenAI(instructions, prompt) {
@@ -344,9 +317,7 @@ async function callGemini(instructions, prompt) {
   const data = await safeJson(response);
   ensureOk(response, data);
 
-  return (
-    data?.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("") || ""
-  );
+  return data?.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("") || "";
 }
 
 async function callGroq(instructions, prompt) {
@@ -383,10 +354,7 @@ async function callAnthropic(instructions, prompt) {
       max_tokens: 1024,
       system: instructions,
       messages: [
-        {
-          role: "user",
-          content: prompt
-        }
+        { role: "user", content: prompt }
       ]
     })
   });
@@ -428,42 +396,18 @@ function ensureOk(response, data) {
   const lower = String(message).toLowerCase();
 
   if (response.status === 401 || response.status === 403) {
-    throw createProviderError(
-      message,
-      "auth_error",
-      "Authentication failed for this provider."
-    );
+    throw createProviderError(message, "auth_error", "Authentication failed for this provider.");
   }
 
-  if (
-    response.status === 429 ||
-    lower.includes("rate limit") ||
-    lower.includes("too many requests")
-  ) {
-    throw createProviderError(
-      message,
-      "rate_limit",
-      "This provider is rate-limited right now."
-    );
+  if (response.status === 429 || lower.includes("rate limit") || lower.includes("too many requests")) {
+    throw createProviderError(message, "rate_limit", "This provider is rate-limited right now.");
   }
 
-  if (
-    lower.includes("insufficient_quota") ||
-    lower.includes("quota") ||
-    response.status === 402
-  ) {
-    throw createProviderError(
-      message,
-      "insufficient_quota",
-      "This provider has reached its quota or billing limit."
-    );
+  if (lower.includes("insufficient_quota") || lower.includes("quota") || response.status === 402) {
+    throw createProviderError(message, "insufficient_quota", "This provider has reached its quota or billing limit.");
   }
 
-  throw createProviderError(
-    message,
-    "provider_error",
-    "This provider had a temporary error."
-  );
+  throw createProviderError(message, "provider_error", "This provider had a temporary error.");
 }
 
 function createProviderError(message, reason, publicMessage) {
@@ -474,14 +418,13 @@ function createProviderError(message, reason, publicMessage) {
 }
 
 function labelProvider(name) {
-  const map = {
+  return {
     openai: "OpenAI",
     gemini: "Gemini",
     groq: "Groq",
     anthropic: "Anthropic",
     openrouter: "OpenRouter"
-  };
-  return map[name] || name;
+  }[name] || name;
 }
 
 async function safeJson(response) {
@@ -493,5 +436,5 @@ async function safeJson(response) {
 }
 
 app.listen(PORT, () => {
-  console.log(`Zhuxin multi-provider backend listening on port ${PORT}`);
+  console.log(`Zhuxin legal-aware multi-provider backend listening on port ${PORT}`);
 });
